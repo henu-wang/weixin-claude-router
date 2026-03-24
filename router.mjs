@@ -26,6 +26,40 @@ function runAppleScript(script) {
 }
 
 // ============================================================
+// 标签页别名（持久化到 ~/.iterm-tab-aliases.json）
+// ============================================================
+const ALIAS_FILE = path.join(os.homedir(), ".iterm-tab-aliases.json");
+
+function loadAliases() {
+  try {
+    return JSON.parse(fs.readFileSync(ALIAS_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveAliases(aliases) {
+  fs.writeFileSync(ALIAS_FILE, JSON.stringify(aliases, null, 2), "utf-8");
+}
+
+function setAlias(name, tabIndex) {
+  const aliases = loadAliases();
+  aliases[name.toLowerCase()] = tabIndex;
+  saveAliases(aliases);
+}
+
+function removeAlias(name) {
+  const aliases = loadAliases();
+  const key = name.toLowerCase();
+  if (key in aliases) {
+    delete aliases[key];
+    saveAliases(aliases);
+    return true;
+  }
+  return false;
+}
+
+// ============================================================
 // iTerm2 操作
 // ============================================================
 
@@ -140,6 +174,9 @@ end tell
 // 智能匹配
 // ============================================================
 
+// 最低匹配分数阈值：低于此分数视为"未匹配"，避免误路由
+const MIN_MATCH_SCORE = 15;
+
 function cleanTabName(name) {
   return name.replace(/\s*\(.*?\)\s*$/, "").trim().toLowerCase();
 }
@@ -155,9 +192,9 @@ function matchScore(query, tabName) {
   if (t.includes(q)) score += q.length * 8;
   if (q.includes(clean) && clean.length > 0) score += clean.length * 8;
 
+  // 单字符匹配权重降低（中文单字匹配容易误触）
   for (const char of q) {
-    if (char.length > 0 && clean.includes(char)) score += 3;
-    if (char.length > 0 && t.includes(char)) score += 1;
+    if (char.length > 0 && clean.includes(char)) score += 1;
   }
 
   let maxSubLen = 0;
@@ -185,35 +222,131 @@ function matchScore(query, tabName) {
 
 function findBestTab(query, tabs) {
   if (!query || tabs.length === 0) return null;
+
+  // 优先匹配别名（精确匹配，最高优先级）
+  const aliases = loadAliases();
+  const qLower = query.toLowerCase().trim();
+  // 完整匹配别名
+  if (qLower in aliases) {
+    const aliasTab = tabs.find(t => t.index === aliases[qLower]);
+    if (aliasTab) return aliasTab;
+  }
+  // query 中包含别名关键词（如 "#社媒 发一条" 中的 "社媒"）
+  for (const [alias, idx] of Object.entries(aliases)) {
+    if (qLower.includes(alias)) {
+      const aliasTab = tabs.find(t => t.index === idx);
+      if (aliasTab) return aliasTab;
+    }
+  }
+
   let bestTab = null;
   let bestScore = 0;
   for (const tab of tabs) {
     const score = matchScore(query, tab.name);
     if (score > bestScore) { bestScore = score; bestTab = tab; }
   }
-  return bestScore > 0 ? bestTab : null;
+  // 必须超过最低阈值才视为有效匹配
+  return bestScore >= MIN_MATCH_SCORE ? bestTab : null;
+}
+
+// ============================================================
+// 元查询检测 — 识别"关于标签页本身"的查询
+// ============================================================
+
+const META_PATTERNS = [
+  /每个.*标签/,
+  /所有.*标签/,
+  /标签.*都.*干/,
+  /标签.*状态/,
+  /标签.*在.*做/,
+  /标签.*干.*啥/,
+  /标签.*干.*嘛/,
+  /在干啥/,
+  /在干嘛/,
+  /在做什么/,
+  /都在.*干/,
+  /都在.*做/,
+  /汇总/,
+  /总览/,
+  /概览/,
+  /all\s*tabs/i,
+  /what.*tabs.*doing/i,
+  /status\s*all/i,
+  /overview/i,
+];
+
+function isMetaQuery(text) {
+  return META_PATTERNS.some(p => p.test(text));
+}
+
+function summarizeAllTabs(tabs, linesPerTab = 8) {
+  if (tabs.length === 0) return "iTerm2 没有打开的标签页。";
+  const parts = [`共 ${tabs.length} 个标签页:\n`];
+  for (const tab of tabs) {
+    const displayName = tab.name.replace(/\s*\(.*?\)$/, "").trim();
+    const output = captureTab(tab.name, linesPerTab);
+    const lastLine = output.split("\n").filter(Boolean).slice(-3).join("\n") || "(空)";
+    parts.push(`━━ ${tab.index}. ${displayName} ━━\n${lastLine}\n`);
+  }
+  const result = parts.join("\n");
+  const maxLen = 2000;
+  return result.length > maxLen ? result.slice(0, maxLen) + "\n...(截断)" : result;
 }
 
 // ============================================================
 // 消息解析
 // ============================================================
-const PREFIX_RE = /^#(\S+)\s+([\s\S]*)$/;
 
 function parseMessage(text, tabs) {
-  const match = text.match(PREFIX_RE);
-  if (match) {
-    const tag = match[1];
-    const actualText = match[2].trim();
-    const tab = findBestTab(tag, tabs);
-    if (tab) return { tab, actualText, method: "指定" };
-    const fallback = findBestTab(text, tabs);
-    if (fallback) return { tab: fallback, actualText, method: "智能" };
-    return { tab: null, tag, actualText, method: "未找到" };
+  // 元查询：问的是标签页本身，不路由到任何标签
+  if (isMetaQuery(text)) {
+    return { tab: null, actualText: text, method: "元查询" };
   }
 
+  const aliases = loadAliases();
+
+  // 1) 序号开头: "4 发一条" → 标签4，发送"发一条"
+  const numMatch = text.match(/^(\d+)\s+([\s\S]+)$/);
+  if (numMatch) {
+    const idx = parseInt(numMatch[1]);
+    const rest = numMatch[2].trim();
+    const tab = tabs.find(t => t.index === idx);
+    if (tab) return { tab, actualText: rest, method: "序号" };
+  }
+
+  // 2) 别名开头: "社媒 发一条" → 匹配别名"社媒"，发送"发一条"
+  //    按别名长度降序匹配，避免短别名误吃长别名
+  const sortedAliases = Object.entries(aliases).sort((a, b) => b[0].length - a[0].length);
+  const textLower = text.toLowerCase();
+  for (const [alias, idx] of sortedAliases) {
+    // 别名在开头，后面跟空格+内容
+    if (textLower.startsWith(alias) && text.length > alias.length) {
+      const after = text.slice(alias.length);
+      // 别名后必须是空格/标点，不能是别名的一部分
+      if (/^[\s,，。！？、:：]/.test(after)) {
+        const rest = after.replace(/^[\s,，。！？、:：]+/, "").trim();
+        const tab = tabs.find(t => t.index === idx);
+        if (tab && rest) return { tab, actualText: rest, method: "别名" };
+      }
+    }
+    // 完整匹配别名（只发别名本身 → 读取该标签输出）
+    if (textLower === alias) {
+      const tab = tabs.find(t => t.index === idx);
+      if (tab) {
+        const output = captureTab(tab.name, 15);
+        const display = tab.name.replace(/\s*\(.*?\)$/, "").trim();
+        const trimmed = output.length > 1500 ? output.slice(-1500) + "\n...(截断)" : output;
+        return { tab: null, actualText: text, method: "别名查看", prebuiltReply: `[${display}] 最近输出:\n${trimmed}` };
+      }
+    }
+  }
+
+  // 3) 智能匹配（模糊匹配标签名或别名）
   const best = findBestTab(text, tabs);
   if (best) return { tab: best, actualText: text, method: "智能" };
-  return { tab: tabs[0], actualText: text, method: "默认" };
+
+  // 4) 无法匹配
+  return { tab: null, actualText: text, method: "未匹配" };
 }
 
 // ============================================================
@@ -221,25 +354,34 @@ function parseMessage(text, tabs) {
 // ============================================================
 function helpText() {
   const tabs = getTabs();
+  const aliases = loadAliases();
   const lines = [
     "微信 → iTerm2 路由器",
     "",
-    "三种发送方式:",
-    "  #关键词 指令 → 如 #api 查状态",
+    "发送方式:",
+    "  别名 指令 → 如: 社媒 发一条",
+    "  序号 指令 → 如: 4 发一条",
     "  直接发指令 → 自动匹配最相关标签页",
-    "  匹配不到 → 默认发到第1个标签页",
+    "  只发别名 → 查看该标签最近输出",
     "",
     "管理命令:",
+    "  /status — 查看所有标签最近输出",
+    "  /tabs — 查看所有标签页",
+    "  /read 关键词 — 读取某个标签输出",
+    "  /read — 读取所有标签输出",
+    "  /name 序号 名称 — 给标签命名",
+    "  /unname 名称 — 删除别名",
     "  /new 命令 — 新开标签页执行命令",
     "  /close 关键词 — 关闭匹配的标签页",
-    "  /tabs — 查看所有标签页",
-    "  /read 关键词 — 读取标签页输出",
     "  /help — 显示帮助",
     "",
     `当前 ${tabs.length} 个标签页:`,
   ];
   for (const t of tabs) {
-    lines.push(`  ${t.index}. ${t.name.replace(/\s*\(.*?\)$/, "").trim()}`);
+    const display = t.name.replace(/\s*\(.*?\)$/, "").trim();
+    const alias = Object.entries(aliases).find(([, idx]) => idx === t.index);
+    const aliasStr = alias ? ` [${alias[0]}]` : "";
+    lines.push(`  ${t.index}. ${display}${aliasStr}`);
   }
   return lines.join("\n");
 }
@@ -258,8 +400,26 @@ const routingAgent = {
 
     if (text === "/tabs" || text === "标签") {
       const tabs = getTabs();
-      const list = tabs.map(t => `${t.index}. ${t.name.replace(/\s*\(.*?\)$/, "").trim()}`).join("\n");
+      const aliases = loadAliases();
+      const list = tabs.map(t => {
+        const display = t.name.replace(/\s*\(.*?\)$/, "").trim();
+        const alias = Object.entries(aliases).find(([, idx]) => idx === t.index);
+        const aliasStr = alias ? ` [${alias[0]}]` : "";
+        return `${t.index}. ${display}${aliasStr}`;
+      }).join("\n");
       return { text: `${tabs.length} 个标签页:\n${list}` };
+    }
+
+    // /status — 查看所有标签页最近输出摘要
+    if (/^\/status$/i.test(text) || text === "状态") {
+      const tabs = getTabs();
+      return { text: summarizeAllTabs(tabs) };
+    }
+
+    // /read (无参数) — 也当作查看所有标签
+    if (text === "/read" || text === "/readall") {
+      const tabs = getTabs();
+      return { text: summarizeAllTabs(tabs) };
     }
 
     const newMatch = text.match(/^\/new\s+(.+)$/s);
@@ -274,6 +434,27 @@ const routingAgent = {
       const keyword = closeMatch[1].trim();
       const result = closeTab(keyword);
       return { text: result === "closed" ? `已关闭匹配「${keyword}」的标签页` : `找不到匹配「${keyword}」的标签页` };
+    }
+
+    // /name 序号 名称 — 给标签页设别名
+    const nameMatch = text.match(/^\/name\s+(\d+)\s+(.+)$/);
+    if (nameMatch) {
+      const idx = parseInt(nameMatch[1]);
+      const alias = nameMatch[2].trim();
+      const tabs = getTabs();
+      const tab = tabs.find(t => t.index === idx);
+      if (!tab) return { text: `标签页 #${idx} 不存在。用 /tabs 查看。` };
+      setAlias(alias, idx);
+      const display = tab.name.replace(/\s*\(.*?\)$/, "").trim();
+      return { text: `✓ 标签页 #${idx} (${display}) 已命名为「${alias}」\n\n之后可用 #${alias} 指令 来路由。` };
+    }
+
+    // /unname 名称 — 删除别名
+    const unnameMatch = text.match(/^\/unname\s+(.+)$/);
+    if (unnameMatch) {
+      const alias = unnameMatch[1].trim();
+      const ok = removeAlias(alias);
+      return { text: ok ? `✓ 已删除别名「${alias}」` : `别名「${alias}」不存在` };
     }
 
     const readMatch = text.match(/^\/read\s+#?(.+)$/);
@@ -294,9 +475,42 @@ const routingAgent = {
     if (tabs.length === 0) return { text: "iTerm2 没有打开的标签页。用 /new 命令新建。" };
 
     const parsed = parseMessage(text, tabs);
-    const tab = parsed.tab;
-    if (!tab) return { text: "没有可用的标签页" };
 
+    // 元查询：返回所有标签摘要
+    if (parsed.method === "元查询") {
+      console.log(`[router] [元查询] ← ${text.slice(0, 80)}`);
+      return { text: summarizeAllTabs(tabs) };
+    }
+
+    // 别名查看：只发了别名本身，返回该标签输出
+    if (parsed.prebuiltReply) {
+      return { text: parsed.prebuiltReply };
+    }
+
+    // 未匹配：提示用户
+    if (!parsed.tab) {
+      const aliases = loadAliases();
+      const list = tabs.map(t => {
+        const display = t.name.replace(/\s*\(.*?\)$/, "").trim();
+        const alias = Object.entries(aliases).find(([, idx]) => idx === t.index);
+        return `  ${t.index}. ${display}${alias ? ` [${alias[0]}]` : ""}`;
+      }).join("\n");
+      return {
+        text: [
+          "未匹配到标签页，请指定目标:",
+          "",
+          `当前 ${tabs.length} 个标签页:`,
+          list,
+          "",
+          "用法:",
+          "  别名 指令 — 如: 社媒 发一条",
+          "  序号 指令 — 如: 4 发一条",
+          "  /status — 查看所有标签最近输出",
+        ].join("\n"),
+      };
+    }
+
+    const tab = parsed.tab;
     const displayName = tab.name.replace(/\s*\(.*?\)$/, "").trim();
     console.log(`[router] [${parsed.method}] → [${displayName}] ← ${parsed.actualText.slice(0, 80)}`);
 
