@@ -1,0 +1,16 @@
+{
+  "name": "weixin-claude-router",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Route WeChat & Feishu messages to Claude Code sessions in iTerm2 with smart matching",
+  "scripts": {
+    "start:wechat": "node router.mjs",
+    "start:feishu": "node feishu-router.mjs",
+    "login": "npx weixin-acp login"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "weixin-acp": "^0.3.1",
+    "weixin-agent-sdk": "^0.1.0"
+  }
+}
